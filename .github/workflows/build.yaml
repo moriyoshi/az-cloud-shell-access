@@ -1,0 +1,38 @@
+---
+on:
+  release:
+    types:
+      - created
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        goos:
+          - linux
+          - freebsd
+          - darwin
+        goarch:
+          - amd64
+          - arm
+          - arm64
+        exclude:
+          - goarch: arm
+            goos: darwin
+    steps:
+      - uses: technote-space/auto-cancel-redundant-workflow@v1
+      - uses: actions/checkout@v2
+      - uses: wangyoucao577/go-release-action@v1.20
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          goos: ${{ matrix.goos }}
+          goarch: ${{ matrix.goarch }}
+          goversion: latest
+          project_path: "."
+          binary_name: "az-cloud-shell-access"
+          ldflags: "-X 'main.defaultClientId=${{ secrets.DEFAULT_CLIENT_ID }}'"
+          extra_files: LICENSE README.md
+          md5sum: false
+          sha256sum: true
