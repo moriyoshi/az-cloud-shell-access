@@ -29,6 +29,7 @@ type CloudConsole struct {
 	tokenFetcher TokenFetcher
 	nowGetter    func() time.Time
 	log          func(string)
+	envVars      map[string]string
 }
 
 type ReadWriterWithTermInfo interface {
@@ -36,6 +37,7 @@ type ReadWriterWithTermInfo interface {
 	ScreenSize() (int, int, error)
 	MakeRaw() (interface{}, error)
 	Restore(interface{}) error
+	SendBreak(int) error
 	SetReadDeadline(time.Time) error
 }
 
@@ -427,7 +429,40 @@ func (cc *CloudConsole) notifyScreenSizeChange(ctx context.Context, uri string, 
 	}
 }
 
-func (cc *CloudConsole) interact(ctx context.Context, wsData *websocket.Conn, wsCtrl *websocket.Conn, uri string, sed *ServiceBusEndpointDescriptor, rw ReadWriterWithTermInfo) error {
+type ReadWriteCloserWithDeadline interface {
+	ReadWriterWithDeadline
+	io.Closer
+}
+
+func packetOrientedCopy(dst io.Writer, src io.Reader) error {
+	var buf [131072]byte
+
+	for {
+		b := buf[:]
+		n, err := src.Read(b)
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			return err
+		}
+		if n == 0 {
+			break
+		}
+		b = b[:n]
+		for len(b) > 0 {
+			wn, err := dst.Write(b)
+			if err != nil {
+				return err
+			}
+			b = b[wn:]
+		}
+	}
+
+	return nil
+}
+
+func (cc *CloudConsole) interact(ctx context.Context, crw ReadWriteCloserWithDeadline, wsCtrl *websocket.Conn, uri string, sed *ServiceBusEndpointDescriptor, rw ReadWriterWithTermInfo) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -449,44 +484,22 @@ func (cc *CloudConsole) interact(ctx context.Context, wsData *websocket.Conn, ws
 		<-ctx.Done()
 		signal.Stop(sigCh)
 		close(sigCh)
+		rw.SetReadDeadline(longLongAgo) //nolint: errcheck
+		rw.SendBreak(1)                 // nolint: errcheck
+		crw.Close()                     //nolint: errcheck
 	}()
 
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		defer cancel()
-		for {
-			_, b, err := wsData.ReadMessage()
-			if err != nil {
-				return
-			}
-			n, err := rw.Write(b)
-			if err != nil {
-				return
-			}
-			if n != len(b) {
-				return
-			}
-		}
+		io.Copy(rw, crw) //nolint: errcheck
 	}()
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		defer cancel()
-		b := make([]byte, 131072)
-		for {
-			n, err := rw.Read(b)
-			if err != nil {
-				return
-			}
-			err = wsData.WriteMessage(
-				websocket.BinaryMessage,
-				b[:n],
-			)
-			if err != nil {
-				return
-			}
-		}
+		packetOrientedCopy(crw, rw) //nolint: errcheck
 	}()
 	var winchFlag uintptr
 	wg.Add(1)
@@ -517,12 +530,12 @@ func (cc *CloudConsole) interact(ctx context.Context, wsData *websocket.Conn, ws
 		for sig := range sigCh {
 			switch sig {
 			case syscall.SIGINT:
-				wsData.SetReadDeadline(longLongAgo)                   //nolint: errcheck
-				rw.SetReadDeadline(longLongAgo)                       //nolint: errcheck
-				wsData.WriteMessage(websocket.CloseMessage, []byte{}) //nolint: errcheck
+				if crw, ok := (crw).(interface{ CloseAsync(bool) bool }); ok {
+					crw.CloseAsync(true)
+				} else {
+					break outer
+				}
 			case syscall.SIGTERM:
-				wsData.SetReadDeadline(longLongAgo) //nolint: errcheck
-				rw.SetReadDeadline(longLongAgo)     //nolint: errcheck
 				break outer
 			case syscall.SIGWINCH:
 				atomic.StoreUintptr(&winchFlag, 1)
@@ -558,7 +571,9 @@ func (cc *CloudConsole) startIsolated(ctx context.Context, ccs *CloudConsoleSett
 			wsCtrl.Close()
 		}
 	}()
-	return cc.interact(ctx, wsData, wsCtrl, cs.Uri, sed, rw)
+	crw := NewWSReadWriter(ctx, wsData, websocket.BinaryMessage)
+	defer crw.Close()
+	return cc.interact(ctx, crw, wsCtrl, cs.Uri, sed, rw)
 }
 
 func (cc *CloudConsole) startPublic(ctx context.Context, ccs *CloudConsoleSettings, rw ReadWriterWithTermInfo) error {
@@ -586,7 +601,20 @@ func (cc *CloudConsole) startPublic(ctx context.Context, ccs *CloudConsoleSettin
 			wsCtrl.Close()
 		}
 	}()
-	return cc.interact(ctx, wsData, wsCtrl, cs.Uri, sed, rw)
+	crw := NewWSReadWriter(ctx, wsData, websocket.BinaryMessage)
+	defer crw.Close()
+	switch ccs.PreferredShellType {
+	case "bash":
+		err = injectEnvironmentVariablesBash(cc.envVars, crw, cc.nowGetter)
+	case "pwsh":
+		err = injectEnvironmentVariablesPwsh(cc.envVars, crw, cc.nowGetter)
+	default:
+		err = fmt.Errorf("unknown shell type: %s", ccs.PreferredShellType)
+	}
+	if err != nil {
+		return err
+	}
+	return cc.interact(ctx, crw, wsCtrl, cs.Uri, sed, rw)
 }
 
 func (cc *CloudConsole) Start(ctx context.Context, rw ReadWriterWithTermInfo) error {
@@ -850,5 +878,6 @@ func NewCloudConsole(baseUrl string, tx *http.Transport, tokenFetcher TokenFetch
 		tokenFetcher: tokenFetcher,
 		nowGetter:    nowGetter,
 		log:          log,
+		envVars:      map[string]string{},
 	}, nil
 }
