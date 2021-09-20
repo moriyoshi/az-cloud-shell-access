@@ -28,6 +28,7 @@ type CloudConsole struct {
 	wsDialer     *websocket.Dialer
 	tokenFetcher TokenFetcher
 	nowGetter    func() time.Time
+	log          func(string)
 }
 
 type ReadWriterWithTermInfo interface {
@@ -178,7 +179,7 @@ func (cc *CloudConsole) waitForProvisionCompleted(ctx context.Context, ccs *Clou
 	}
 }
 
-func buildServiceBusOpenRequest(ctx context.Context, t *oauth2.Tokens, uri string, cols, rows int, shellType string) (*http.Request, error) {
+func buildRequestServiceBusOpen(ctx context.Context, t *oauth2.Tokens, uri string, cols, rows int, shellType string) (*http.Request, error) {
 	_uri, err := url.Parse(uri)
 	if err != nil {
 		return nil, err
@@ -226,7 +227,7 @@ func (cc *CloudConsole) openServiceBus(ctx context.Context, uri string, shellTyp
 	if err != nil {
 		return nil, err
 	}
-	req, err := buildServiceBusOpenRequest(ctx, t, uri, cols, rows, shellType)
+	req, err := buildRequestServiceBusOpen(ctx, t, uri, cols, rows, shellType)
 	if err != nil {
 		return nil, err
 	}
@@ -253,7 +254,7 @@ type ServiceBusAuthorizationResponse struct {
 	Token string `json:"token"`
 }
 
-func buildServiceBusAuthorizationRequest(ctx context.Context, t *oauth2.Tokens, uri string) (*http.Request, error) {
+func buildRequestServiceBusAuthorization(ctx context.Context, t *oauth2.Tokens, uri string) (*http.Request, error) {
 	_uri, err := url.Parse(uri)
 	if err != nil {
 		return nil, err
@@ -280,7 +281,7 @@ func (cc *CloudConsole) authorizeServiceBus(ctx context.Context, uri string) (*S
 	if err != nil {
 		return nil, err
 	}
-	req, err := buildServiceBusAuthorizationRequest(ctx, t, uri)
+	req, err := buildRequestServiceBusAuthorization(ctx, t, uri)
 	if err != nil {
 		return nil, err
 	}
@@ -369,7 +370,7 @@ func (cc *CloudConsole) openWsChannelsPublic(ctx context.Context, cs *ConsoleSes
 
 var longLongAgo = time.Unix(0, 0)
 
-func buildScreenSizeChangeRequest(ctx context.Context, t *oauth2.Tokens, uri string, sed *ServiceBusEndpointDescriptor, cols, rows int) (*http.Request, error) {
+func buildRequestScreenSizeChange(ctx context.Context, t *oauth2.Tokens, uri string, sed *ServiceBusEndpointDescriptor, cols, rows int) (*http.Request, error) {
 	_uri, err := url.Parse(uri)
 	if err != nil {
 		return nil, err
@@ -408,7 +409,7 @@ func (cc *CloudConsole) notifyScreenSizeChange(ctx context.Context, uri string, 
 	if err != nil {
 		return err
 	}
-	req, err := buildScreenSizeChangeRequest(ctx, t, uri, sed, cols, rows)
+	req, err := buildRequestScreenSizeChange(ctx, t, uri, sed, cols, rows)
 	if err != nil {
 		return err
 	}
@@ -605,7 +606,234 @@ func (cc *CloudConsole) Start(ctx context.Context, rw ReadWriterWithTermInfo) er
 	}
 }
 
-func NewCloudConsole(baseUrl string, tx *http.Transport, tokenFetcher TokenFetcher, nowGetter func() time.Time) (*CloudConsole, error) {
+func buildRequestOpenPort(ctx context.Context, t *oauth2.Tokens, uri string, port int) (*http.Request, error) {
+	_uri, err := url.Parse(uri)
+	if err != nil {
+		return nil, err
+	}
+	_uri.Path = strings.TrimRight(_uri.Path, "/") + fmt.Sprintf("/ports/%d/open", port)
+	if _uri.RawQuery != "" {
+		_uri.RawQuery += "&"
+	}
+	req, err := http.NewRequestWithContext(
+		ctx,
+		"POST",
+		_uri.String(),
+		strings.NewReader("{}"),
+	)
+	if err != nil {
+		return nil, err
+	}
+	req.Header["Origin"] = []string{"https://ux.console.azure.com"}
+	req.Header["Referer"] = []string{"https://ux.console.azure.com/"}
+	req.Header["Content-Type"] = []string{"application/json"}
+	req.Header["Authorization"] = []string{fmt.Sprintf("%s %s", t.TokenType, t.AccessToken)}
+	return req, nil
+}
+
+func (cc *CloudConsole) openPort(ctx context.Context, uri string, port int) error {
+	t, err := cc.tokenFetcher()
+	if err != nil {
+		return err
+	}
+	req, err := buildRequestOpenPort(ctx, t, uri, port)
+	if err != nil {
+		return err
+	}
+	resp, err := cc.hc.Do(req)
+	if err != nil {
+		return err
+	}
+	if b, ok, err := readResponse(resp); !ok {
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("endpoint %s returned status code %d: %s", req.URL.String(), resp.StatusCode, string(b))
+	} else {
+		return nil
+	}
+}
+
+func buildRequestClosePort(ctx context.Context, t *oauth2.Tokens, uri string, port int) (*http.Request, error) {
+	_uri, err := url.Parse(uri)
+	if err != nil {
+		return nil, err
+	}
+	_uri.Path = strings.TrimRight(_uri.Path, "/") + fmt.Sprintf("/ports/%d/close", port)
+	if _uri.RawQuery != "" {
+		_uri.RawQuery += "&"
+	}
+	req, err := http.NewRequestWithContext(
+		ctx,
+		"POST",
+		_uri.String(),
+		strings.NewReader("{}"),
+	)
+	if err != nil {
+		return nil, err
+	}
+	req.Header["Origin"] = []string{"https://ux.console.azure.com"}
+	req.Header["Referer"] = []string{"https://ux.console.azure.com/"}
+	req.Header["Content-Type"] = []string{"application/json"}
+	req.Header["Authorization"] = []string{fmt.Sprintf("%s %s", t.TokenType, t.AccessToken)}
+	return req, nil
+}
+
+func (cc *CloudConsole) closePort(ctx context.Context, uri string, port int) error {
+	t, err := cc.tokenFetcher()
+	if err != nil {
+		return err
+	}
+	req, err := buildRequestClosePort(ctx, t, uri, port)
+	if err != nil {
+		return err
+	}
+	resp, err := cc.hc.Do(req)
+	if err != nil {
+		return err
+	}
+	if b, ok, err := readResponse(resp); !ok {
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("endpoint %s returned status code %d: %s", req.URL.String(), resp.StatusCode, string(b))
+	} else {
+		return nil
+	}
+}
+
+func (cc *CloudConsole) proxy(ctx context.Context, ccs *CloudConsoleSettings, port int, avail func(ctx context.Context, token string, url string) error) error {
+	cs, err := cc.waitForProvisionCompleted(ctx, ccs)
+	if err != nil {
+		return err
+	}
+	_url, err := url.Parse(cs.Uri)
+	if err != nil {
+		return fmt.Errorf("failed to parse service bus URI: %w: %s", err, cs.Uri)
+	}
+	sar, err := cc.authorizeServiceBus(ctx, cs.Uri)
+	if err != nil {
+		return err
+	}
+	cc.hc.Jar.SetCookies(
+		_url, []*http.Cookie{
+			&http.Cookie{
+				Name:  "auth-token",
+				Value: sar.Token,
+			},
+		},
+	)
+	err = cc.openPort(ctx, cs.Uri, port)
+	if err != nil {
+		return err
+	}
+	defer cc.closePort(ctx, cs.Uri, port) //nolint:errcheck
+	return avail(ctx, sar.Token, fmt.Sprintf("%s/proxy/%d/", cs.Uri, port))
+}
+
+func (cc *CloudConsole) Proxy(
+	ctx context.Context, port int, localAddr string,
+	startCallback func(context.Context, int, string) error,
+	stopCallback func(int, string),
+) error {
+	ccs, err := cc.getCloudConsoleSettings(ctx)
+	if err != nil {
+		return err
+	}
+	return cc.proxy(
+		ctx, ccs, port,
+		func(ctx context.Context, token string, _url string) error {
+			parsedUrl, err := url.Parse(_url)
+			if err != nil {
+				return err
+			}
+			ctx, cancel := context.WithCancel(ctx)
+
+			doHandle := func(w http.ResponseWriter, req *http.Request) error {
+				req.Header.Del("host")
+				_url := *parsedUrl
+				parsedRequestUri, err := url.ParseRequestURI(req.RequestURI)
+				if err != nil {
+					return fmt.Errorf("failed to parse request URI: %w", err)
+				}
+				_url.Path = strings.TrimRight(parsedUrl.Path, "/") + parsedRequestUri.Path
+				_url.RawQuery = parsedRequestUri.RawQuery
+				req.URL = &_url
+				req.RequestURI = ""
+				resp, err := cc.hc.Do(req)
+				if err != nil {
+					return err
+				}
+				if resp.Body != nil {
+					defer resp.Body.Close()
+					if resp.ContentLength >= 0 {
+						_, err := io.Copy(w, &io.LimitedReader{R: resp.Body, N: resp.ContentLength})
+						if err != nil {
+							cc.log(err.Error())
+						}
+					} else {
+						_, err := io.Copy(w, resp.Body)
+						if err != nil {
+							cc.log(err.Error())
+						}
+					}
+				}
+				wh := w.Header()
+				for k, vs := range resp.Header {
+					wh[k] = append(wh[k], vs...)
+				}
+				return nil
+			}
+
+			s := &http.Server{
+				Addr: localAddr,
+				Handler: http.HandlerFunc(
+					func(w http.ResponseWriter, req *http.Request) {
+						err := doHandle(w, req)
+						if err != nil {
+							cc.log(err.Error())
+							http.Error(w, "Internal Server Error", 500)
+						}
+					},
+				),
+			}
+			defer cancel()
+			defer stopCallback(port, localAddr)
+			err = startCallback(ctx, port, localAddr)
+			if err != nil {
+				return err
+			}
+			sigCh := make(chan os.Signal, 1024)
+			signal.Notify(sigCh, syscall.SIGINT)
+			var wg sync.WaitGroup
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-ctx.Done()
+				signal.Stop(sigCh)
+			}()
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				select {
+				case <-ctx.Done():
+				case <-sigCh:
+					s.Close() //nolint: errcheck
+				}
+			}()
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				defer cancel()
+				err = s.ListenAndServe()
+			}()
+			wg.Wait()
+			return err
+		},
+	)
+}
+
+func NewCloudConsole(baseUrl string, tx *http.Transport, tokenFetcher TokenFetcher, nowGetter func() time.Time, log func(string)) (*CloudConsole, error) {
 	jar, err := cookiejar.New(nil)
 	if err != nil {
 		return nil, err
@@ -621,5 +849,6 @@ func NewCloudConsole(baseUrl string, tx *http.Transport, tokenFetcher TokenFetch
 		},
 		tokenFetcher: tokenFetcher,
 		nowGetter:    nowGetter,
+		log:          log,
 	}, nil
 }

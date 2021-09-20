@@ -12,6 +12,7 @@ import (
 	"github.com/Azure/go-autorest/autorest/azure/cli"
 	"github.com/moriyoshi/az-cloud-shell-access/internal/oauth2"
 	"github.com/shibukawa/configdir"
+	"github.com/spf13/cobra"
 )
 
 var progName = filepath.Base(os.Args[0])
@@ -47,17 +48,7 @@ const authEndpointPrefix = "https://login.microsoftonline.com/"
 
 var defaultClientId string
 
-func main() {
-	tenantId := os.Getenv("AZURE_TENANT_ID")
-	clientId := os.Getenv("AZURE_CLIENT_ID")
-	var err error
-	if tenantId == "" {
-		tenantId, err = determineTernantWithAzCliProfile()
-		if err != nil {
-			message("no default subscription found in Azure CLI profile, and AZURE_TENANT_ID environment variable is not set.")
-			os.Exit(255)
-		}
-	}
+func consoleDo(tenantId, clientId string, callback func(context.Context, *CloudConsole) error) (string, int) {
 	tx := &http.Transport{
 		MaxIdleConns:    2,
 		IdleConnTimeout: 10 * time.Second,
@@ -67,15 +58,11 @@ func main() {
 	var credsPath string
 	{
 		c := cd.QueryFolders(configdir.Cache)[0]
-		err = os.MkdirAll(c.Path, 0700)
+		err := os.MkdirAll(c.Path, 0700)
 		if err != nil {
-			message("failed to create cache directory")
-			os.Exit(1)
+			return "failed to create cache directory", 1
 		}
 		credsPath = filepath.Join(c.Path, "accessTokens.json")
-	}
-	if clientId == "" {
-		clientId = defaultClientId
 	}
 	ctx := context.Background()
 	c, err := oauth2.NewClient(
@@ -101,13 +88,11 @@ func main() {
 		),
 	)
 	if err != nil {
-		message(err.Error())
-		os.Exit(1)
+		return err.Error(), 1
 	}
 	_, err = c.FetchTokens(ctx, false)
 	if err != nil {
-		message(err.Error())
-		os.Exit(1)
+		return err.Error(), 1
 	}
 
 	console, err := NewCloudConsole(
@@ -117,16 +102,106 @@ func main() {
 			return c.FetchTokens(ctx, true)
 		},
 		time.Now,
+		message,
 	)
+	if err != nil {
+		return err.Error(), 1
+	}
+
+	err = callback(ctx, console)
+	if err != nil {
+		return err.Error(), 2
+	}
+	return "", 0
+}
+
+var tenantId string
+var clientId string
+
+func checkTenantIdAndClientId() {
+	if clientId == "" {
+		message("no default client ID is provided, and AZURE_CLIENT_ID environment variable is not set.")
+		os.Exit(1)
+	}
+	if tenantId == "" {
+		message("no default subscription found in Azure CLI profile, and AZURE_TENANT_ID environment variable is not set.")
+		os.Exit(1)
+	}
+}
+
+var rootCmd = &cobra.Command{
+	Use: progName,
+}
+
+func init() {
+	cobra.OnInitialize(initConfig)
+	rootCmd.PersistentFlags().StringVar(&tenantId, "tenant-id", "", "Azure Tenant ID")
+	rootCmd.PersistentFlags().StringVar(&clientId, "client-id", "", "Azure Client ID")
+	if clientId == "" {
+		clientId = defaultClientId
+	}
+	rootCmd.AddCommand(&cobra.Command{
+		Use:   "shell",
+		Short: "start interative shell",
+		Run: func(cmd *cobra.Command, args []string) {
+			checkTenantIdAndClientId()
+			msg, status := consoleDo(tenantId, clientId, func(ctx context.Context, console *CloudConsole) error {
+				defer message("connection closed")
+				return console.Start(ctx, &TerminalReadWriter{os.Stdin})
+			})
+			if msg != "" {
+				message(msg)
+			}
+			os.Exit(status)
+		},
+	})
+	{
+		var port int
+		var localAddr string
+		proxyCmd := &cobra.Command{
+			Use:   "proxy",
+			Short: "start HTTP proxy",
+			Run: func(cmd *cobra.Command, args []string) {
+				if localAddr == "" {
+					localAddr = fmt.Sprintf("[::1]:%d", port)
+				}
+				checkTenantIdAndClientId()
+				msg, status := consoleDo(tenantId, clientId, func(ctx context.Context, console *CloudConsole) error {
+					return console.Proxy(
+						ctx, port, localAddr,
+						func(ctx context.Context, port int, localAddr string) error {
+							message(fmt.Sprintf("proxying port %d => %s", port, localAddr))
+							return nil
+						},
+						func(_ int, _ string) {
+							message("proxy port closed")
+						},
+					)
+				})
+				if msg != "" {
+					message(msg)
+				}
+				os.Exit(status)
+			},
+		}
+		proxyCmd.Flags().IntVar(&port, "port", 8091, "port to proxy")
+		proxyCmd.Flags().StringVar(&localAddr, "local-addr", "", "local address")
+		rootCmd.AddCommand(proxyCmd)
+	}
+}
+
+func initConfig() {
+	tenantId = os.Getenv("AZURE_TENANT_ID")
+	clientId = os.Getenv("AZURE_CLIENT_ID")
+	if tenantId == "" {
+		tenantId, _ = determineTernantWithAzCliProfile()
+	}
+}
+
+func main() {
+	err := rootCmd.Execute()
 	if err != nil {
 		message(err.Error())
 		os.Exit(1)
 	}
-
-	err = console.Start(ctx, &TerminalReadWriter{os.Stdin})
-	if err != nil {
-		message(err.Error())
-		os.Exit(2)
-	}
-	fmt.Fprintf(os.Stderr, "connection closed.\n")
 }
