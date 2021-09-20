@@ -48,8 +48,8 @@ type CloudConsoleSettings struct {
 		DiskSizeInGB             int    `json:"diskSizeInG"`
 	} `json:"storageProfile"`
 	TerminalSettings struct {
-		FontSize  string `json:"fontSize"` // "Small", "Large", ...
-		FontStyle string `json:"Monospace"`
+		FontSize  string `json:"fontSize"`  // "Small", "Large", ...
+		FontStyle string `json:"fontStyle"` // "Monospace", "Consolas", ...
 	} `json:"terminalSettings"`
 	VnetSettings struct {
 		NetworkProfileResourceId string `json:"networkProfileResourceId"`
