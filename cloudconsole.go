@@ -36,6 +36,7 @@ type ReadWriterWithTermInfo interface {
 	ScreenSize() (int, int, error)
 	MakeRaw() (interface{}, error)
 	Restore(interface{}) error
+	SendBreak(int) error
 	SetReadDeadline(time.Time) error
 }
 
@@ -427,7 +428,12 @@ func (cc *CloudConsole) notifyScreenSizeChange(ctx context.Context, uri string, 
 	}
 }
 
-func (cc *CloudConsole) interact(ctx context.Context, wsData *websocket.Conn, wsCtrl *websocket.Conn, uri string, sed *ServiceBusEndpointDescriptor, rw ReadWriterWithTermInfo) error {
+type ReadWriteCloserWithDeadline interface {
+	ReadWriterWithDeadline
+	io.Closer
+}
+
+func (cc *CloudConsole) interact(ctx context.Context, crw ReadWriteCloserWithDeadline, wsCtrl *websocket.Conn, uri string, sed *ServiceBusEndpointDescriptor, rw ReadWriterWithTermInfo) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -449,44 +455,22 @@ func (cc *CloudConsole) interact(ctx context.Context, wsData *websocket.Conn, ws
 		<-ctx.Done()
 		signal.Stop(sigCh)
 		close(sigCh)
+		rw.SetReadDeadline(longLongAgo) //nolint: errcheck
+		rw.SendBreak(1)                 // nolint: errcheck
+		crw.Close()                     //nolint: errcheck
 	}()
 
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		defer cancel()
-		for {
-			_, b, err := wsData.ReadMessage()
-			if err != nil {
-				return
-			}
-			n, err := rw.Write(b)
-			if err != nil {
-				return
-			}
-			if n != len(b) {
-				return
-			}
-		}
+		io.Copy(rw, crw) //nolint: errcheck
 	}()
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		defer cancel()
-		b := make([]byte, 131072)
-		for {
-			n, err := rw.Read(b)
-			if err != nil {
-				return
-			}
-			err = wsData.WriteMessage(
-				websocket.BinaryMessage,
-				b[:n],
-			)
-			if err != nil {
-				return
-			}
-		}
+		io.Copy(crw, rw) //nolint: errcheck
 	}()
 	var winchFlag uintptr
 	wg.Add(1)
@@ -517,12 +501,12 @@ func (cc *CloudConsole) interact(ctx context.Context, wsData *websocket.Conn, ws
 		for sig := range sigCh {
 			switch sig {
 			case syscall.SIGINT:
-				wsData.SetReadDeadline(longLongAgo)                   //nolint: errcheck
-				rw.SetReadDeadline(longLongAgo)                       //nolint: errcheck
-				wsData.WriteMessage(websocket.CloseMessage, []byte{}) //nolint: errcheck
+				if crw, ok := (crw).(interface{ CloseAsync(bool) bool }); ok {
+					crw.CloseAsync(true)
+				} else {
+					break outer
+				}
 			case syscall.SIGTERM:
-				wsData.SetReadDeadline(longLongAgo) //nolint: errcheck
-				rw.SetReadDeadline(longLongAgo)     //nolint: errcheck
 				break outer
 			case syscall.SIGWINCH:
 				atomic.StoreUintptr(&winchFlag, 1)
@@ -533,63 +517,47 @@ func (cc *CloudConsole) interact(ctx context.Context, wsData *websocket.Conn, ws
 	return nil
 }
 
-func (cc *CloudConsole) startIsolated(ctx context.Context, ccs *CloudConsoleSettings, rw ReadWriterWithTermInfo) error {
+func (cc *CloudConsole) initiateSessionIsolated(ctx context.Context, ccs *CloudConsoleSettings, rw ReadWriterWithTermInfo) (string, *ServiceBusEndpointDescriptor, *websocket.Conn, *websocket.Conn, error) {
 	cs, err := cc.waitForProvisionCompleted(ctx, ccs)
 	if err != nil {
-		return err
+		return "", nil, nil, nil, err
 	}
 	_, err = cc.authorizeServiceBus(ctx, cs.Uri)
 	if err != nil {
-		return err
+		return "", nil, nil, nil, err
 	}
 	sed, err := cc.openServiceBus(ctx, cs.Uri, ccs.PreferredShellType, rw)
 	if err != nil {
-		return err
+		return "", nil, nil, nil, err
 	}
 	wsData, wsCtrl, err := cc.openWsChannelsIsolated(ctx, cs, sed)
 	if err != nil {
-		return err
+		return "", nil, nil, nil, err
 	}
-	defer func() {
-		if wsData != nil {
-			wsData.Close()
-		}
-		if wsCtrl != nil {
-			wsCtrl.Close()
-		}
-	}()
-	return cc.interact(ctx, wsData, wsCtrl, cs.Uri, sed, rw)
+	return cs.Uri, sed, wsData, wsCtrl, nil
 }
 
-func (cc *CloudConsole) startPublic(ctx context.Context, ccs *CloudConsoleSettings, rw ReadWriterWithTermInfo) error {
+func (cc *CloudConsole) initiateSessionPublic(ctx context.Context, ccs *CloudConsoleSettings, rw ReadWriterWithTermInfo) (string, *ServiceBusEndpointDescriptor, *websocket.Conn, *websocket.Conn, error) {
 	cs, err := cc.waitForProvisionCompleted(ctx, ccs)
 	if err != nil {
-		return err
+		return "", nil, nil, nil, err
 	}
 	_, err = cc.authorizeServiceBus(ctx, cs.Uri)
 	if err != nil {
-		return err
+		return "", nil, nil, nil, err
 	}
 	sed, err := cc.openServiceBus(ctx, cs.Uri, ccs.PreferredShellType, rw)
 	if err != nil {
-		return err
+		return "", nil, nil, nil, err
 	}
 	wsData, wsCtrl, err := cc.openWsChannelsPublic(ctx, cs, sed)
 	if err != nil {
-		return err
+		return "", nil, nil, nil, err
 	}
-	defer func() {
-		if wsData != nil {
-			wsData.Close()
-		}
-		if wsCtrl != nil {
-			wsCtrl.Close()
-		}
-	}()
-	return cc.interact(ctx, wsData, wsCtrl, cs.Uri, sed, rw)
+	return cs.Uri, sed, wsData, wsCtrl, nil
 }
 
-func (cc *CloudConsole) Start(ctx context.Context, rw ReadWriterWithTermInfo) error {
+func (cc *CloudConsole) Start(ctx context.Context, rw ReadWriterWithTermInfo, envVars map[string]string) error {
 	// do the preflight check
 	_, _, err := rw.ScreenSize()
 	if err != nil {
@@ -599,11 +567,41 @@ func (cc *CloudConsole) Start(ctx context.Context, rw ReadWriterWithTermInfo) er
 	if err != nil {
 		return err
 	}
+	var uri string
+	var sed *ServiceBusEndpointDescriptor
+	var wsData, wsCtrl *websocket.Conn
 	if ccs.NetworkType == "Isolated" {
-		return cc.startIsolated(ctx, ccs, rw)
+		uri, sed, wsData, wsCtrl, err = cc.initiateSessionIsolated(ctx, ccs, rw)
 	} else {
-		return cc.startPublic(ctx, ccs, rw)
+		uri, sed, wsData, wsCtrl, err = cc.initiateSessionPublic(ctx, ccs, rw)
 	}
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if wsData != nil {
+			wsData.Close()
+		}
+		if wsCtrl != nil {
+			wsCtrl.Close()
+		}
+	}()
+	crw := NewWSReadWriter(ctx, wsData, websocket.BinaryMessage, true)
+	defer crw.Close()
+	if envVars != nil {
+		switch ccs.PreferredShellType {
+		case "bash":
+			err = injectEnvironmentVariablesBash(envVars, crw, cc.nowGetter)
+		case "pwsh":
+			err = injectEnvironmentVariablesPwsh(envVars, crw, cc.nowGetter)
+		default:
+			err = fmt.Errorf("unknown shell type: %s", ccs.PreferredShellType)
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return cc.interact(ctx, crw, wsCtrl, uri, sed, rw)
 }
 
 func buildRequestOpenPort(ctx context.Context, t *oauth2.Tokens, uri string, port int) (*http.Request, error) {

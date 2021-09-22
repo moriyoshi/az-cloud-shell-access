@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/Azure/go-autorest/autorest/azure/cli"
@@ -140,21 +141,36 @@ func init() {
 	cobra.OnInitialize(initConfig)
 	rootCmd.PersistentFlags().StringVar(&tenantId, "tenant-id", "", "Azure Tenant ID")
 	rootCmd.PersistentFlags().StringVar(&clientId, "client-id", "", "Azure Client ID")
-	rootCmd.AddCommand(&cobra.Command{
-		Use:   "shell",
-		Short: "start interative shell",
-		Run: func(cmd *cobra.Command, args []string) {
-			checkTenantIdAndClientId()
-			msg, status := consoleDo(tenantId, clientId, func(ctx context.Context, console *CloudConsole) error {
-				defer message("connection closed")
-				return console.Start(ctx, &TerminalReadWriter{os.Stdin})
-			})
-			if msg != "" {
-				message(msg)
-			}
-			os.Exit(status)
-		},
-	})
+	{
+		var envVars []string
+		shellCmd := &cobra.Command{
+			Use:   "shell",
+			Short: "start interative shell",
+			Run: func(cmd *cobra.Command, args []string) {
+				checkTenantIdAndClientId()
+				envVarsMap := make(map[string]string)
+				for _, envVar := range envVars {
+					pair := strings.SplitN(envVar, "=", 2)
+					k := pair[0]
+					v := ""
+					if len(pair) > 1 {
+						v = pair[1]
+					}
+					envVarsMap[k] = v
+				}
+				msg, status := consoleDo(tenantId, clientId, func(ctx context.Context, console *CloudConsole) error {
+					defer message("connection closed")
+					return console.Start(ctx, &TerminalReadWriter{os.Stdin}, envVarsMap)
+				})
+				if msg != "" {
+					message(msg)
+				}
+				os.Exit(status)
+			},
+		}
+		shellCmd.Flags().StringSliceVarP(&envVars, "env", "e", nil, "environment variable in NAME=VALUE format")
+		rootCmd.AddCommand(shellCmd)
+	}
 	{
 		var port int
 		var localAddr string
