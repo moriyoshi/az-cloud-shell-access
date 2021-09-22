@@ -120,6 +120,9 @@ var clientId string
 
 func checkTenantIdAndClientId() {
 	if clientId == "" {
+		clientId = defaultClientId
+	}
+	if clientId == "" {
 		message("no default client ID is provided, and AZURE_CLIENT_ID environment variable is not set.")
 		os.Exit(1)
 	}
@@ -137,9 +140,6 @@ func init() {
 	cobra.OnInitialize(initConfig)
 	rootCmd.PersistentFlags().StringVar(&tenantId, "tenant-id", "", "Azure Tenant ID")
 	rootCmd.PersistentFlags().StringVar(&clientId, "client-id", "", "Azure Client ID")
-	if clientId == "" {
-		clientId = defaultClientId
-	}
 	rootCmd.AddCommand(&cobra.Command{
 		Use:   "shell",
 		Short: "start interative shell",
