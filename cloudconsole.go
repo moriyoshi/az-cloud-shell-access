@@ -26,6 +26,7 @@ type CloudConsole struct {
 	baseUrl      string
 	hc           *http.Client
 	wsDialer     *websocket.Dialer
+	wsUpgrader   *websocket.Upgrader
 	tokenFetcher TokenFetcher
 	nowGetter    func() time.Time
 	log          func(string)
@@ -733,6 +734,113 @@ func (cc *CloudConsole) proxy(ctx context.Context, ccs *CloudConsoleSettings, po
 	return avail(ctx, sar.Token, fmt.Sprintf("%s/proxy/%d/", cs.Uri, port))
 }
 
+func buildWsUrlForRequest(req *http.Request) *url.URL {
+	_url := new(url.URL)
+	*_url = *req.URL
+	switch _url.Scheme {
+	case "https":
+		_url.Scheme = "wss"
+	case "http":
+		_url.Scheme = "ws"
+	default:
+		_url.Scheme = "ws"
+	}
+	return _url
+}
+
+func wsCopy(dst *websocket.Conn, src *websocket.Conn) error {
+	for {
+		t, b, err := src.ReadMessage()
+		if err != nil {
+			return err
+		}
+		err = dst.WriteMessage(t, b)
+		if err != nil {
+			return err
+		}
+	}
+}
+
+func (cc *CloudConsole) buildDoHandleWebSocket(ctx context.Context) func(http.ResponseWriter, *http.Request) error {
+	return func(w http.ResponseWriter, req *http.Request) error {
+		ctx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		var uc, dc *websocket.Conn
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-ctx.Done()
+			if uc != nil {
+				uc.Close() //nolint::errcheck
+			}
+			if dc != nil {
+				dc.Close() //nolint::errcheck
+			}
+		}()
+
+		_url := buildWsUrlForRequest(req)
+		reqH := req.Header.Clone()
+		reqH.Del("Sec-Websocket-Key")
+		reqH.Del("Sec-Websocket-Version")
+		reqH.Del("Sec-Websocket-Extensions")
+		reqH.Del("Connection")
+		reqH.Del("Upgrade")
+		uc, resp, err := cc.wsDialer.DialContext(ctx, _url.String(), reqH)
+		if err != nil {
+			return fmt.Errorf("failed to establish websocket connection to upstream: %s: %w", _url, err)
+		}
+		resp.Header.Del("Sec-Websocket-Accept")
+		resp.Header.Del("Connection")
+		resp.Header.Del("Upgrade")
+		dc, err = cc.wsUpgrader.Upgrade(w, req, resp.Header)
+		if err != nil {
+			return fmt.Errorf("failed to upgrade websocket connection for downstream: %w", err)
+		}
+
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer cancel()
+			wsCopy(uc, dc) //nolint:errcheck
+		}()
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer cancel()
+			wsCopy(dc, uc) //nolint:errcheck
+		}()
+		wg.Wait()
+		return nil
+	}
+}
+
+func (cc *CloudConsole) doHandleHttp(w http.ResponseWriter, req *http.Request) error {
+	resp, err := cc.hc.Do(req)
+	if err != nil {
+		return err
+	}
+	if resp.Body != nil {
+		defer resp.Body.Close()
+		if resp.ContentLength >= 0 {
+			_, err := io.Copy(w, &io.LimitedReader{R: resp.Body, N: resp.ContentLength})
+			if err != nil {
+				cc.log(err.Error())
+			}
+		} else {
+			_, err := io.Copy(w, resp.Body)
+			if err != nil {
+				cc.log(err.Error())
+			}
+		}
+	}
+	wh := w.Header()
+	for k, vs := range resp.Header {
+		wh[k] = append(wh[k], vs...)
+	}
+	return nil
+}
+
 func (cc *CloudConsole) Proxy(
 	ctx context.Context, port int, localAddr string,
 	startCallback func(context.Context, int, string) error,
@@ -751,8 +859,9 @@ func (cc *CloudConsole) Proxy(
 			}
 			ctx, cancel := context.WithCancel(ctx)
 
+			doHandleWebsocket := cc.buildDoHandleWebSocket(ctx)
 			doHandle := func(w http.ResponseWriter, req *http.Request) error {
-				req.Header.Del("host")
+				req.Header.Del("Host")
 				_url := *parsedUrl
 				parsedRequestUri, err := url.ParseRequestURI(req.RequestURI)
 				if err != nil {
@@ -762,29 +871,11 @@ func (cc *CloudConsole) Proxy(
 				_url.RawQuery = parsedRequestUri.RawQuery
 				req.URL = &_url
 				req.RequestURI = ""
-				resp, err := cc.hc.Do(req)
-				if err != nil {
-					return err
+				if strings.ToLower(req.Header.Get("Connection")) == "upgrade" && strings.ToLower(req.Header.Get("Upgrade")) == "websocket" {
+					return doHandleWebsocket(w, req)
+				} else {
+					return cc.doHandleHttp(w, req)
 				}
-				if resp.Body != nil {
-					defer resp.Body.Close()
-					if resp.ContentLength >= 0 {
-						_, err := io.Copy(w, &io.LimitedReader{R: resp.Body, N: resp.ContentLength})
-						if err != nil {
-							cc.log(err.Error())
-						}
-					} else {
-						_, err := io.Copy(w, resp.Body)
-						if err != nil {
-							cc.log(err.Error())
-						}
-					}
-				}
-				wh := w.Header()
-				for k, vs := range resp.Header {
-					wh[k] = append(wh[k], vs...)
-				}
-				return nil
 			}
 
 			s := &http.Server{
@@ -849,6 +940,7 @@ func NewCloudConsole(baseUrl string, tx *http.Transport, tokenFetcher TokenFetch
 		wsDialer: &websocket.Dialer{
 			Jar: jar,
 		},
+		wsUpgrader:   &websocket.Upgrader{},
 		tokenFetcher: tokenFetcher,
 		nowGetter:    nowGetter,
 		log:          log,
