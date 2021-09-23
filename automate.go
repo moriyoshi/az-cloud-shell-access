@@ -18,8 +18,8 @@ type ReadWriterWithDeadline interface {
 }
 
 func expectAnyStringBy(rw ReadWriterWithDeadline, d time.Time) ([]byte, error) {
-	rw.SetReadDeadline(d)
-	defer rw.SetReadDeadline(time.Time{})
+	rw.SetReadDeadline(d)                 //nolint:errcheck
+	defer rw.SetReadDeadline(time.Time{}) //nolint:errcheck
 	var b []byte
 	rb := make([]byte, 1024)
 outer:
@@ -39,7 +39,7 @@ outer:
 func sendEmptyLine(rw ReadWriterWithDeadline) error {
 	b := [2]byte{'\n', 0}
 	n, err := rw.Write(b[:1])
-	if err != nil {
+	if err != nil || n == 0 {
 		return fmt.Errorf("failed to write 1 bytes: %w", err)
 	}
 	n, err = io.ReadFull(rw, b[:])

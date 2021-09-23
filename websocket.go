@@ -262,8 +262,7 @@ func (rw *WSReadWriter) SetWriteDeadline(t time.Time) error {
 }
 
 func (rw *WSReadWriter) SetDeadline(t time.Time) error {
-	var err error
-	err = rw.SetReadDeadline(t)
+	err := rw.SetReadDeadline(t)
 	if err != nil {
 		return err
 	}
