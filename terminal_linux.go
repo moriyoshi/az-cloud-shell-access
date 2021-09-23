@@ -1,5 +1,5 @@
-//go:build aix || dragonfly || freebsd || linux || netbsd || openbsd || solaris || zos
-// +build aix dragonfly freebsd linux netbsd openbsd solaris zos
+//go:build linux || zos
+// +build linux zos
 
 package main
 
@@ -8,6 +8,14 @@ import (
 
 	"time"
 )
+
+func (rw *TerminalReadWriter) SendBreak(duration time.Duration) error {
+	if err := unix.IoctlSetInt(int(rw.Fd()), unix.TIOCSBRK, 0); err != nil {
+		return err
+	}
+	time.Sleep(duration)
+	return unix.IoctlSetInt(int(rw.Fd()), unix.TIOCCBRK, 0)
+}
 
 func (rw *TerminalReadWriter) SetVMinVTime(vmin int, vtime time.Duration) error {
 	tos, err := unix.IoctlGetTermios(int(rw.Fd()), unix.TCGETS)
