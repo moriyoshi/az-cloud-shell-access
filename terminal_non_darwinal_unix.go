@@ -16,5 +16,5 @@ func (rw *TerminalReadWriter) SetVMinVTime(vmin int, vtime time.Duration) error 
 	}
 	tos.Cc[unix.VMIN] = byte(vmin)
 	tos.Cc[unix.VTIME] = byte(time.Duration(vtime) / (time.Second / 10))
-	unix.IoctlSetTermios(int(os.Stdin.Fd()), unix.TCSETS, tos)
+	return unix.IoctlSetTermios(int(rw.Fd()), unix.TCSETS, tos)
 }
