@@ -36,8 +36,9 @@ type ReadWriterWithTermInfo interface {
 	ScreenSize() (int, int, error)
 	MakeRaw() (interface{}, error)
 	Restore(interface{}) error
-	SendBreak(int) error
+	SendBreak(time.Duration) error
 	SetReadDeadline(time.Time) error
+	SetVMinVTime(vmin int, vtime time.Duration) error
 }
 
 type CloudConsoleSettings struct {
@@ -441,10 +442,13 @@ func (cc *CloudConsole) interact(ctx context.Context, crw ReadWriteCloserWithDea
 
 	tt, err := rw.MakeRaw()
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to change tty mode: %w", err)
 	}
 
-	defer rw.Restore(tt) //nolint:errcheck
+	defer func() {
+		rw.SetVMinVTime(1, 0) //nolint:errcheck
+		rw.Restore(tt)        //nolint:errcheck
+	}()
 
 	sigCh := make(chan os.Signal, 1024)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGWINCH)
@@ -455,9 +459,9 @@ func (cc *CloudConsole) interact(ctx context.Context, crw ReadWriteCloserWithDea
 		<-ctx.Done()
 		signal.Stop(sigCh)
 		close(sigCh)
-		rw.SetReadDeadline(longLongAgo) //nolint: errcheck
-		rw.SendBreak(1)                 // nolint: errcheck
-		crw.Close()                     //nolint: errcheck
+		rw.SetVMinVTime(0, time.Second/10) //nolint: errcheck
+		rw.SetReadDeadline(longLongAgo)    //nolint: errcheck
+		crw.Close()                        //nolint: errcheck
 	}()
 
 	wg.Add(1)
