@@ -753,6 +753,7 @@ func (cc *CloudConsole) Proxy(
 
 			doHandle := func(w http.ResponseWriter, req *http.Request) error {
 				req.Header.Del("host")
+				req.Host = ""
 				_url := *parsedUrl
 				parsedRequestUri, err := url.ParseRequestURI(req.RequestURI)
 				if err != nil {
