@@ -767,6 +767,10 @@ func (cc *CloudConsole) Proxy(
 				if err != nil {
 					return err
 				}
+				wh := w.Header()
+				for k, vs := range resp.Header {
+					wh[k] = append(wh[k], vs...)
+				}
 				if resp.Body != nil {
 					defer resp.Body.Close()
 					if resp.ContentLength >= 0 {
@@ -780,10 +784,6 @@ func (cc *CloudConsole) Proxy(
 							cc.log(err.Error())
 						}
 					}
-				}
-				wh := w.Header()
-				for k, vs := range resp.Header {
-					wh[k] = append(wh[k], vs...)
 				}
 				return nil
 			}
